@@ -1,0 +1,99 @@
+name: emaki Seedance trial (direct API)
+
+# FIXED workflow — bypasses the broken hanshs474/emaki-action@v1 entirely.
+# That action's action.yml line 22 puts ${{ secrets.EMAKI_API_KEY }} inside an
+# input DESCRIPTION, which GitHub refuses to load ("Unrecognized named-value:
+# 'secrets'") — run #1 died at "Set up job" in 12s, before any emaki API call.
+#
+# This version calls the emaki API directly with node (no third-party action),
+# using the exact endpoints from the action's own MIT-licensed client.js:
+#   POST /api/user/get-user-credits {}            -> data.remainingCredits
+#   POST /api/video/ai {prompt, model, parameters} -> data.id
+#   POST /api/video/status {videoId}               -> data.status / videoUrl
+# Auth: Authorization: Bearer <key>. Parameters shape from index.js:
+#   {generate_audio, aspect_ratio, duration (number), resolution}.
+#
+# ⚠️ DO NOT RUN until emaki credits are confirmed > 0. On 21 Nov 2026 the
+# account showed balance 0 (the advertised 90 free signup credits were never
+# granted). The credits step below fails fast with a clear message if 0.
+# To use: upload this file to the repo as .github/workflows/emaki-trial.yml
+# (replacing the broken-action version), then run from the Actions tab.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  trial-clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EMAKI_API_KEY: ${{ secrets.EMAKI_API_KEY }}
+    steps:
+      - name: Generate trial clip (Seedance 2 Mini, direct API)
+        id: clip
+        run: |
+          cat > emaki-trial.mjs <<'EOF'
+          const BASE = 'https://emaki.ai';
+          const KEY = process.env.EMAKI_API_KEY;
+          if (!KEY) { console.error('emaki auth error: no API key in EMAKI_API_KEY'); process.exit(1); }
+          async function post(path, payload) {
+            const res = await fetch(`${BASE}${path}`, {
+              method: 'POST',
+              headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
+              body: JSON.stringify(payload || {}),
+            });
+            let body = {};
+            try { body = await res.json(); } catch {}
+            return [res.status, body];
+          }
+          // 1. Credits first — fail fast on an empty balance.
+          const [cs, cb] = await post('/api/user/get-user-credits', {});
+          if (!(cs === 200 && cb && cb.code === 0 && cb.data && typeof cb.data.remainingCredits === 'number')) {
+            console.error(`credits check failed (HTTP ${cs}): ${JSON.stringify(cb)}`);
+            process.exit(1);
+          }
+          console.log(`emaki credits balance: ${cb.data.remainingCredits}`);
+          if (cb.data.remainingCredits <= 0) {
+            console.error('emaki quota error: balance is 0 — no free credits granted. Top up at https://emaki.ai/pricing or wait for the signup grant.');
+            process.exit(1);
+          }
+          // 2. Submit the trial clip (same prompt/model as the original trial).
+          const [ss, sb] = await post('/api/video/ai', {
+            prompt: 'Cinematic photorealistic dark fantasy: a sapphire-blue dragon spreads its wings on a stormy mountain ledge, rain and lightning behind it, slow camera push-in. No text.',
+            model: 'seedance_2_mini',
+            parameters: { generate_audio: false, aspect_ratio: '16:9', duration: 5, resolution: '720p' },
+          });
+          if (!(ss === 200 && sb && sb.success && sb.data && sb.data.id)) {
+            console.error(`submit failed (HTTP ${ss}): ${JSON.stringify(sb)}`);
+            process.exit(1);
+          }
+          const id = String(sb.data.id);
+          console.log(`submitted seedance_2_mini run ${id}; polling`);
+          // 3. Poll status every 5s, up to 15 min.
+          const deadline = Date.now() + 15 * 60_000;
+          let url = null;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 5000));
+            const [ts, tb] = await post('/api/video/status', { videoId: id });
+            if (!(ts === 200 && tb && tb.success && tb.data)) continue; // dropped poll, keep waiting
+            const d = tb.data;
+            if ((d.status === 'completed' || d.status === 'succeeded') && d.videoUrl) { url = d.videoUrl; break; }
+            if (d.status === 'failed') { console.error(`emaki run ${id} failed (${d.failureCode || 'unknown'})`); process.exit(1); }
+          }
+          if (!url) { console.error(`emaki run ${id} did not finish in 15 min; it may still land in your emaki library`); process.exit(1); }
+          console.log(`clip ready: ${url}`);
+          // 4. Download to assets/trial-clip.mp4
+          const fs = await import('node:fs');
+          fs.mkdirSync('assets', { recursive: true });
+          const res = await fetch(url);
+          if (!res.ok) { console.error(`download failed (HTTP ${res.status})`); process.exit(1); }
+          fs.writeFileSync('assets/trial-clip.mp4', Buffer.from(await res.arrayBuffer()));
+          console.log('saved assets/trial-clip.mp4');
+          EOF
+          node emaki-trial.mjs
+
+      - name: Save clip as download
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-clip
+          path: assets/trial-clip.mp4
